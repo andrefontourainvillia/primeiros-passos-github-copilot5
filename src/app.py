@@ -10,6 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from pymongo import MongoClient
+from typing import Dict, List, Any
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -19,8 +21,13 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-activities = {
+# Connect to MongoDB
+client = MongoClient('mongodb://localhost:27017/')
+db = client['high_school_db']
+activities_collection = db['activities']
+
+# Initial activities data
+initial_activities = {
    "Clube de Xadrez": {
       "description": "Aprenda estratégias e participe de torneios de xadrez",
       "schedule": "Sextas, 15h30 - 17h",
@@ -81,6 +88,26 @@ activities = {
 }
 
 
+@app.on_event("startup")
+def startup_db_client():
+    """Initialize the database on startup if it's empty"""
+    # Check if the activities collection is empty
+    if activities_collection.count_documents({}) == 0:
+        # Insert the initial activities data
+        for activity_name, activity_data in initial_activities.items():
+            activities_collection.insert_one({
+                "_id": activity_name,
+                **activity_data
+            })
+        print("Initialized MongoDB with sample activities")
+
+
+@app.on_event("shutdown")
+def shutdown_db_client():
+    """Close the MongoDB connection on shutdown"""
+    client.close()
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,35 +115,49 @@ def root():
 
 @app.get("/activities")
 def get_activities():
-    return activities
+    """Get all activities from MongoDB"""
+    result = {}
+    for doc in activities_collection.find():
+        activity_name = doc.pop('_id')
+        result[activity_name] = doc
+    return result
 
 
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
-    if activity_name not in activities:
+    activity = activities_collection.find_one({"_id": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Atividade não encontrada")
-
-    # Get the specificy activity
-    activity = activities[activity_name]
 
     # Validar se o estudante já está inscrito
     if email in activity["participants"]:
-      raise HTTPException(status_code=400, detail="Estudante já inscrito nesta atividade")
+        raise HTTPException(status_code=400, detail="Estudante já inscrito nesta atividade")
     
     # Add student
-    activity["participants"].append(email)
+    activities_collection.update_one(
+        {"_id": activity_name},
+        {"$push": {"participants": email}}
+    )
     return {"message": f"{email} inscrito(a) em {activity_name} com sucesso"}
 
 
 @app.post("/activities/{activity_name}/remove")
 def remove_participant(activity_name: str, email: str):
     """Remove a student from an activity"""
-    if activity_name not in activities:
+    # Validate activity exists
+    activity = activities_collection.find_one({"_id": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Atividade não encontrada")
-    activity = activities[activity_name]
+    
+    # Validate student is enrolled
     if email not in activity["participants"]:
         raise HTTPException(status_code=400, detail="Participante não está inscrito nesta atividade")
-    activity["participants"].remove(email)
+    
+    # Remove student
+    activities_collection.update_one(
+        {"_id": activity_name},
+        {"$pull": {"participants": email}}
+    )
     return {"message": f"{email} removido(a) de {activity_name} com sucesso"}
